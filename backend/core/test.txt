@@ -1,0 +1,572 @@
+from django.db import models
+from django.core.validators import MaxValueValidator, MinValueValidator
+from datetime import datetime, timedelta
+from accounts.models import *
+from accounts.utils import *
+from django.utils import timezone
+from django.core.files.storage import FileSystemStorage
+
+from django.db.models.signals import post_save, m2m_changed
+from django.dispatch import receiver
+
+question_fs = FileSystemStorage(location='/media/questions')
+
+class TestSeries(models.Model):
+    name = models.CharField(max_length=200)
+    price = models.IntegerField()
+    mrp = models.IntegerField(blank=True, null=True)
+    date_added = models.DateField(auto_now_add=True)
+    slug = models.SlugField(unique=True, editable=False)
+    visible = models.BooleanField(default=False)
+    exams = models.ManyToManyField(Exam, related_name="test_series", blank=True)
+    discount = models.IntegerField(default=0)
+    registered_students = models.ManyToManyField(Student, blank=True)
+    registered_batches = models.ManyToManyField(Batch, related_name="test_series", blank=True)
+    tests = models.ManyToManyField("Test", related_name="test_series", blank=True)
+    syllabus = models.FileField(upload_to="syllabus", blank=True, null=True)
+    banner = models.CharField(max_length=240, blank=True, null=True)
+    coin_price = models.IntegerField(default=200)
+
+    class Meta:
+        verbose_name = "Test Series"
+        verbose_name_plural = "Test Series"
+
+    def __str__(self):
+        return self.name
+
+    def isFree(self):
+        return self.price == 0
+
+    def save(self, *args, **kwargs):
+        if not self.slug:
+            self.slug = get_unique_slug(self, "name")
+        self.coin_price = self.price
+        super(TestSeries, self).save(*args, **kwargs)
+  
+
+@receiver(m2m_changed, sender=TestSeries.registered_batches.through, dispatch_uid="update_students")
+def update_students(sender, instance, **kwargs):
+    print("updating students in batches for test series")
+    test_series = instance
+    batches = instance.registered_batches.all()
+    for batch in batches:
+        for student in batch.students.all():
+            print("adding ", student, " to ", test_series)
+            test_series.registered_students.add(student)
+
+class Test(models.Model):
+    name = models.CharField(max_length=200)
+    slug = models.SlugField(unique=True, editable=False)
+    date_added = models.DateTimeField(auto_now_add=True)
+    created_by = models.ForeignKey(Teacher, on_delete=models.CASCADE, default=1)
+    registered_students = models.ManyToManyField(Student, related_name="tests", blank=True)
+    registered_batches = models.ManyToManyField(Batch, related_name="tests", blank=True)
+    exam = models.ForeignKey(Exam, related_name="tests", blank=True, null=True, on_delete=models.SET_NULL)
+    aits = models.BooleanField(default=False)
+    activation_time = models.DateTimeField(blank=True, null=True)
+    closing_time = models.DateTimeField(blank=True, null=True)
+    time_alotted = models.DurationField(default=timedelta(hours=3))
+    sections = models.JSONField(blank=True, null=True)
+    questions = models.JSONField(blank=True, null=True)
+    answers = models.JSONField(blank=True, null=True)
+    stats = models.JSONField(blank=True, null=True)
+    corrected = models.BooleanField(default=False)
+    finished = models.BooleanField(default=False)
+    visible = models.BooleanField(default=True)
+    free = models.BooleanField(default=False)
+    marks_list = models.JSONField(blank=True, null=True)
+    syllabus = models.CharField(max_length=1024, blank=True, null=True)
+    instant_result = models.BooleanField(default=0)
+    position = models.IntegerField(default=100)
+
+    def save(self, *args, **kwargs):
+        if not self.slug:
+            self.slug = get_unique_slug(self, "name")
+        super(Test, self).save(*args, **kwargs)
+
+    @property
+    def status(self):
+        if not self.activation_time or timezone.now() < self.activation_time:
+            return 0
+        elif (
+            not self.closing_time
+            or self.activation_time <= timezone.now()
+            and timezone.now() < self.closing_time
+        ):
+            return 1
+        elif self.closing_time <= timezone.now():
+            if not self.corrected and not self.finished:
+                return 2
+            elif not self.finished:
+                return 3
+            else:
+                return 4
+
+    def __str__(self):
+        return str(self.id) + " " + self.name
+
+    def evaluate_sessions(self, include_practice=False):
+        sessions = self.sessions.filter(marks__isnull=True)
+        if not include_practice:
+            sessions = sessions.exclude(practice=True)
+        for session in sessions:
+            session.evaluate(commit=False)
+        Session.objects.bulk_update(sessions, ["marks", "result", "completed"])
+
+    def generate_ranks(self):
+        # sessions = self.sessions.filter(practice=False, completed=True)
+        sessions = self.sessions.filter(completed=True)
+        if len(sessions) > 0:
+            generated = generate_ranks(sessions)
+            if generated:
+                Session.objects.bulk_update(generated.get("sessions", None), ["ranks"])
+                self.marks_list = generated.get("marks_list", None)
+                self.stats = generated.get("stats", None)
+        # self.finished = True
+        self.save()
+
+class QuestionImage(models.Model):
+    image = models.ImageField(upload_to="questions")
+
+    def __str__(self):
+        return self.image.url
+
+
+def validate_file_size(file):
+    if file.size > 256000:
+        raise ValidationError("The maximum image size is 250 KB.")
+    else:
+        return file
+
+class Session(models.Model):
+    student = models.ForeignKey(Student, related_name="sessions", on_delete=models.CASCADE)
+    test = models.ForeignKey(Test, related_name="sessions", null=True, on_delete=models.CASCADE)
+    practice = models.BooleanField(default=False)
+    checkin_time = models.DateTimeField(default=timezone.now)
+    duration = models.DurationField(default=timedelta(hours=3))
+    completed = models.BooleanField(default=False)
+    response = models.JSONField(blank=True, null=True)
+    result = models.JSONField(default=list, blank=True, null=True)
+    current = models.JSONField(blank=True, null=True)
+    marks = models.JSONField(blank=True, null=True)
+    ranks = models.JSONField(blank=True, null=True)
+
+    class Meta:
+        ordering = ["practice", "checkin_time", "test", "student"]
+
+    def __str__(self):
+        return str(self.id) + " " + self.student.user.name + " " + self.test.name
+
+    def expired(self):
+        return self.checkin_time + self.test.time_alotted <= timezone.now()
+
+    def evaluate(self, commit=True):
+        SessionEvaluation(self).evaluate()
+        if commit:
+            self.save()
+
+    def save(self, *args, **kwargs):
+        duration = max(
+            self.test.time_alotted - (timezone.now() - self.checkin_time), timedelta(0)
+        )
+        duration -= timedelta(microseconds=duration.microseconds)
+        self.duration = duration
+        if self.pk is None:
+            self.completed = False
+            self.current = {"question_index": 0, "section_index": 0}
+            response = list()
+            for i, question in enumerate(self.test.questions):
+                response.append(
+                    {
+                        "answer": "",
+                        "answered": "",
+                        "visited": "",
+                        "marked": ""
+                    }
+                )
+            self.response = response
+            self.practice = self.test.status > 1
+
+        super(Session, self).save(*args, **kwargs)
+
+
+class Buyer(models.Model):
+    transaction_id = models.CharField(max_length=200,primary_key=True)
+    user = models.ForeignKey(User, blank=True, null=True, on_delete=models.SET_NULL)
+    test_series = models.ForeignKey(TestSeries, blank=True, null=True, on_delete=models.SET_NULL)
+    date_added = models.DateField(auto_now_add=True)
+    receipt = models.FileField(upload_to='static/payments/', max_length=100, null=True, blank=True)
+    amount = models.IntegerField(validators=[MinValueValidator(1)], null=False, blank=False)
+    verified = models.BooleanField(default=False)
+
+    def __str__(self):
+        return self.user.name()
+
+class Payment(models.Model):
+    transaction_id = models.CharField(max_length=200)
+    receipt = models.FileField(upload_to='static/receipt/', max_length=100, null=True, blank=True)
+    date_added = models.DateField(auto_now_add=True)
+    student = models.ForeignKey(
+        Student,
+        related_name="payments",
+        blank=True,
+        null=True,
+        on_delete=models.SET_NULL,
+    )
+    amount = models.IntegerField(default=0)
+    verified = models.BooleanField(default=False)
+    test_series = models.ForeignKey(
+        TestSeries, blank=True, null=True, on_delete=models.SET_NULL
+    )
+    lecture_series = models.ForeignKey(
+        "LectureSeries", blank=True, null=True, on_delete=models.SET_NULL
+    )
+    study_materials = models.ForeignKey(
+        "StudyMaterial", blank=True, null=True, on_delete=models.SET_NULL
+    )
+    batch = models.ForeignKey(
+        Batch, blank=True, null=True, on_delete=models.SET_NULL
+    )
+    show = models.BooleanField(default=False)
+    with_coins = models.BooleanField(default=False)
+
+    def __str__(self):
+        return str(self.student) + " " + str(self.date_added)
+
+    def save(self, *args, **kwargs):
+        if self.verified:
+            if self.test_series is not None:
+                self.test_series.registered_students.add(self.student)
+                for test in self.test_series.tests.all():
+                    # print(f'adding {self.student} to {test}')
+                    test.registered_students.add(self.student)
+            if self.lecture_series is not None:
+                self.lecture_series.registered_students.add(self.student)
+                for video in self.lecture_series.videos.all():
+                    video.registered_students.add(self.student)
+            if self.study_materials is not None:
+                self.study_materials.registered_students.add(self.student)
+                for material in self.study_materials.materials.all():
+                    material.registered_students.add(self.student)
+
+        super(Payment, self).save(*args, **kwargs)
+
+class Transaction(models.Model):
+    TRANSACTIONS_TYPE_CHOICES = (
+        ("CASH", "Cash"),
+        ("UPI", "UPI"),
+        ("NETBANKING", "Netbanking"),
+        ("PAYTM", "PayTM"),
+        ("OTHERS", "Others"),
+    )
+    date_added = models.DateField(auto_now_add=True)
+    credits_added = models.IntegerField(default=0)
+    transaction_id = models.CharField(
+        max_length=200, null=True, blank=True, unique=True
+    )
+    mode = models.CharField(max_length=10, choices=TRANSACTIONS_TYPE_CHOICES)
+    amount = models.IntegerField(default=0)
+
+    def __str__(self):
+        return (
+            self.mode + " / " + self.transaction_id
+        )
+
+    def save(self, *args, **kwargs):
+        if self.pk is None:
+            try:
+                self.credits_added = (
+                    self.amount * Variable.objects.get(name="CREDITS_PER_RUPEE").value
+                )
+            except:
+                self.credits_added = 0
+        super().save(*args, **kwargs)
+
+class CreditUse(models.Model):
+    id = models.AutoField(primary_key=True)
+    test = models.ForeignKey(Test, null=True, on_delete=models.SET_NULL)
+    date_added = models.DateField(auto_now_add=True)
+    credits_used = models.IntegerField(default=0)
+
+    def __str__(self):
+        return (
+            str(self.date_added)
+            + " / "
+            + str(self.credits_used)
+        )
+
+    class Meta:
+        verbose_name_plural = "Credits Usage"
+
+
+class ResetCode(models.Model):
+    id = models.AutoField(primary_key=True)
+    user = models.ForeignKey(
+        User, related_name="codes", blank=True, null=True, on_delete=models.SET_NULL
+    )
+    reset_code = models.CharField(max_length=6)
+    date_added = models.DateField(auto_now_add=True)
+    done = models.BooleanField(default=False)
+
+
+class TestSeriesTransaction(models.Model):
+    TRANSACTIONS_TYPE_CHOICES = (
+        ("CASH", "Cash"),
+        ("UPI", "UPI"),
+        ("NETBANKING", "Netbanking"),
+        ("PAYTM", "PayTM"),
+        ("OTHERS", "Others"),
+    )
+    date_added = models.DateField(auto_now_add=True)
+    transaction_id = models.CharField(
+        max_length=200, null=True, blank=True, unique=True
+    )
+    mode = models.CharField(max_length=10, choices=TRANSACTIONS_TYPE_CHOICES)
+    amount = models.IntegerField(default=0)
+    remarks = models.CharField(max_length=50, blank=True, null=True)
+    test_series = models.ManyToManyField(
+        TestSeries, related_name="aits_transactions", blank=False
+    )
+    receipt = models.FileField(upload_to='static/testseriesreceipt/', max_length=100, null=True, blank=True)
+
+    def __str__(self):
+        return f"{self.mode} / {self.transaction_id}"
+
+    class Meta:
+        verbose_name_plural = "Test Series Transactions"
+
+
+class VideoSection(models.Model):
+    name = models.CharField(max_length=200)
+    slug = models.SlugField(unique=False, editable=False)
+    image = models.CharField(
+        default="exam.png", max_length=20 * 1024, blank=True, null=True
+    )
+    position = models.IntegerField(default=100)
+    syllabus = models.FileField(upload_to="syllabus", blank=True, null=True)
+
+
+    def __str__(self):
+        return self.name
+
+    def save(self, *args, **kwargs):
+        if not self.slug:
+            self.slug = get_unique_slug(self, "name")
+        super(VideoSection, self).save(*args, **kwargs)
+
+class Video(models.Model):
+    title = models.CharField(max_length=240)
+    slug = models.SlugField(unique=True, editable=False, max_length=254)
+    date_added = models.DateTimeField(auto_now_add=True)
+    created_by = models.ForeignKey(Teacher, on_delete=models.CASCADE, default=1)
+    thumbnail = models.CharField(max_length=240, blank=True, null=True)
+    url = models.URLField(default="",blank=True, null=True)
+    vimeo_url = models.URLField(
+        default="", blank=True, null=True)
+    live_chat_url = models.URLField(default="", blank=True, null=True)
+    start_time = models.DateTimeField()
+    description = models.TextField(max_length=240)
+    notes = models.CharField(max_length=240, blank=True, null=True)
+    section = models.ForeignKey(VideoSection, related_name="videos", blank=True, null=True, on_delete=models.SET_NULL)
+    visible = models.BooleanField(default=True)
+    free = models.BooleanField(default=False)
+    registered_students = models.ManyToManyField(Student, related_name="videos", blank=True)
+    registered_batches = models.ManyToManyField(Batch, related_name="videos", blank=True)
+    liked_by = models.ManyToManyField(User, related_name="liked_videos", blank=True)
+    position = models.IntegerField(default=100)
+    is_live = models.BooleanField(default=False)
+
+    def save(self, *args, **kwargs):
+        if not self.slug:
+            self.slug = get_unique_slug(self, "title")
+        super(Video, self).save(*args, **kwargs)
+    
+    def __str__(self):
+        return self.title
+
+
+class LectureSeries(models.Model):
+    name = models.CharField(max_length=200)
+    videos = models.ManyToManyField(Video, related_name="lecture_series")
+    price = models.IntegerField()
+    mrp = models.IntegerField(blank=True, null=True)
+    date_added = models.DateField(auto_now_add=True)
+    slug = models.SlugField(unique=True, editable=False)
+    visible = models.BooleanField(default=False)
+    discount = models.IntegerField(default=0)
+    sections = models.ManyToManyField(VideoSection, related_name="lecture_series", blank=True)
+    registered_students = models.ManyToManyField(Student, blank=True)
+    registered_batches = models.ManyToManyField(Batch, related_name="lecture_series", blank=True)
+    banner = models.CharField(max_length=240, blank=True, null=True)
+    coin_price = models.IntegerField(default=200)
+
+    def save(self, *args, **kwargs):
+        if not self.slug:
+            self.slug = get_unique_slug(self, "name")
+        self.coin_price = self.price
+        super(LectureSeries, self).save(*args, **kwargs)
+    
+    def __str__(self):
+        return self.name
+
+class VideoHistory(models.Model):
+    user = models.ForeignKey(Student, related_name="histories", blank=True, null=True, on_delete=models.SET_NULL)
+    video = models.ForeignKey(Video, related_name="histories", blank=True, null=True, on_delete=models.CASCADE)
+    in_time = models.DateTimeField(auto_now_add=True)
+    out_time = models.DateTimeField(blank=True, null=True)
+
+    def __str__(self):
+        if self.video and self.video.title:
+            return str(self.user)+" "+self.video.title
+        return str(self.user)
+
+
+class MaterialSection(models.Model):
+    name = models.CharField(max_length=200)
+    slug = models.SlugField(unique=False, editable=False)
+    image = models.CharField(
+        default="exam.png", max_length=20 * 1024, blank=True, null=True
+    )
+    position = models.IntegerField(default=100)
+    syllabus = models.FileField(upload_to="syllabus", blank=True, null=True)
+
+
+    def __str__(self):
+        return self.name
+
+    def save(self, *args, **kwargs):
+        if not self.slug:
+            self.slug = get_unique_slug(self, "name")
+        super(MaterialSection, self).save(*args, **kwargs)
+
+class Material(models.Model):
+    title = models.CharField(max_length=100)
+    slug = models.SlugField(unique=True, editable=False)
+    date_added = models.DateTimeField(auto_now_add=True)
+    created_by = models.ForeignKey(Teacher, on_delete=models.CASCADE, default=1)
+    material = models.URLField(max_length=300)
+    description = models.TextField(max_length=240)
+    section = models.ForeignKey(MaterialSection, related_name="materials", blank=True, null=True, on_delete=models.SET_NULL)
+    visible = models.BooleanField(default=True)
+    free = models.BooleanField(default=False)
+    registered_students = models.ManyToManyField(Student, related_name="materials", blank=True)
+    position = models.IntegerField(default=100)
+    is_downloadable = models.BooleanField(default=False)
+
+    def save(self, *args, **kwargs):
+        if not self.slug:
+            self.slug = get_unique_slug(self, "title")
+        super(Material, self).save(*args, **kwargs)
+    
+    def __str__(self):
+        return self.title
+
+
+class StudyMaterial(models.Model):
+    name = models.CharField(max_length=200)
+    materials = models.ManyToManyField(Material, related_name="study_materials")
+    price = models.IntegerField()
+    mrp = models.IntegerField(blank=True, null=True)
+    date_added = models.DateField(auto_now_add=True)
+    slug = models.SlugField(unique=True, editable=False)
+    visible = models.BooleanField(default=False)
+    discount = models.IntegerField(default=0)
+    sections = models.ManyToManyField(MaterialSection, related_name="study_materials", blank=True)
+    registered_students = models.ManyToManyField(Student, blank=True)
+    registered_batches = models.ManyToManyField(Batch, related_name="study_materials", blank=True)
+    banner = models.CharField(max_length=240, blank=True, null=True)
+    coin_price = models.IntegerField(default=200)
+
+    def save(self, *args, **kwargs):
+        if not self.slug:
+            self.slug = get_unique_slug(self, "name")
+        self.coin_price = self.price
+        super(StudyMaterial, self).save(*args, **kwargs)
+    
+    def __str__(self):
+        return self.name
+
+class ForumChannel(models.Model):
+    name = models.CharField(max_length=180)
+    slug = models.SlugField(unique=True, editable=False)
+    description = models.CharField(max_length=200, blank=True, null=True)
+    registered_students = models.ManyToManyField(Student, related_name="channels", blank=True)
+    registered_batches = models.ManyToManyField(Batch, related_name="channels", blank=True)
+    banner = models.CharField(max_length=240, blank=True, null=True)
+
+    def save(self, *args, **kwargs):
+        if not self.slug:
+            self.slug = get_unique_slug(self, "name")
+        super(ForumChannel, self).save(*args, **kwargs)
+    
+    def __str__(self):
+        return self.name
+
+class ChannelMessage(models.Model):
+    timestamp = models.DateTimeField(auto_now_add=True)
+    channel = models.ForeignKey(ForumChannel, related_name="messages", on_delete=models.CASCADE)
+    student = models.ForeignKey(Student, related_name="messages", on_delete=models.CASCADE, blank=True, null=True)
+    teacher = models.ForeignKey(Teacher, related_name="messages", on_delete=models.CASCADE, blank=True, null=True)
+    message = models.TextField(blank=True, null=True)
+    image = models.CharField(max_length=230, blank=True, null=True)
+    pdf = models.CharField(max_length=230, blank=True, null=True)
+    audio = models.CharField(max_length=230, blank=True, null=True)
+
+    def __str__(self):
+        if self.teacher:
+            return str(self.channel) + ": " + str(self.teacher)
+        elif self.student:
+            return str(self.channel) + ": " + str(self.student)
+
+
+class TeacherChannel(models.Model):
+    teacher = models.ForeignKey(Teacher, related_name="teacher_channels", on_delete=models.CASCADE, blank=True, null=True)
+    student = models.ForeignKey(Student, related_name="teacher_channels", on_delete=models.CASCADE, blank=True, null=True)
+    name = models.CharField(max_length=180, blank=True, null=True)
+    last_activity = models.DateTimeField()
+
+    class Meta:
+        unique_together=('teacher', 'student')
+
+    def __str__(self):
+        return str(self.teacher) + ": " + str(self.student)
+    
+    def save(self, *args, **kwargs):
+        self.last_activity = timezone.now()
+        super(TeacherChannel, self).save(*args, **kwargs)
+
+class TeacherChannelMessage(models.Model):
+    timestamp = models.DateTimeField(auto_now_add=True)
+    channel = models.ForeignKey(TeacherChannel, related_name="messages", on_delete=models.CASCADE)
+    student = models.ForeignKey(Student, related_name="teacher_messages", on_delete=models.CASCADE, blank=True, null=True)
+    teacher = models.ForeignKey(Teacher, related_name="teacher_messages", on_delete=models.CASCADE, blank=True, null=True)
+    message = models.TextField(blank=True, null=True)
+    image = models.CharField(max_length=230, blank=True, null=True)
+    pdf = models.CharField(max_length=230, blank=True, null=True)
+    audio = models.CharField(max_length=230, blank=True, null=True)
+
+    def __str__(self):
+        if self.teacher:
+            return str(self.channel) + ": " + str(self.teacher)
+        elif self.student:
+            return str(self.channel) + ": " + str(self.student)
+
+@receiver(m2m_changed, sender=LectureSeries.registered_batches.through, dispatch_uid="update_students_lecture")
+def update_students_lecture(sender, instance, **kwargs):
+    print("updating students in batches for lecture series")
+    lecture_series = instance
+    batches = instance.registered_batches.all()
+    for batch in batches:
+        for student in batch.students.all():
+            print("adding ", student, " to ", lecture_series)
+            lecture_series.registered_students.add(student)
+
+@receiver(m2m_changed, sender=StudyMaterial.registered_batches.through, dispatch_uid="update_students_materials")
+def update_students_materials(sender, instance, **kwargs):
+    print("updating students in batches for study materials")
+    material = instance
+    batches = instance.registered_batches.all()
+    for batch in batches:
+        for student in batch.students.all():
+            print("adding ", student, " to ", material)
+            material.registered_students.add(student)
