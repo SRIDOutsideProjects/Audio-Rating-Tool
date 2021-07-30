@@ -3,14 +3,13 @@ import datetime
 from rest_framework.response import Response
 from django.db.models import Q
 from rest_framework import viewsets
-from .serializers import RatingSerializer,RatedAudioSerializer
+from .serializers import RatingSerializer,RatedAudioSerializer,RatedAudioDataSerializer
 from .models import RatedAudio,Rating
 from django.utils import timezone
 from rest_framework.permissions import IsAuthenticated
-from rest_framework.decorators import api_view
-from django.views.decorators.csrf import csrf_exempt
-from rest_framework_simplejwt.tokens import RefreshToken
+from rest_framework.decorators import action
 from rest_framework import status
+from rest_framework.parsers import MultiPartParser
 
 
 from rest_framework_bulk import (
@@ -23,6 +22,23 @@ class RatedAudioViewSet(viewsets.ModelViewSet):
     permission_classes = (IsAuthenticated,)
     queryset = RatedAudio.objects.filter(Q(status=1))
     serializer_class = RatedAudioSerializer
+
+    @action(
+        detail=True,
+        methods=['PUT'],
+        serializer_class=RatedAudioDataSerializer,
+        parser_classes=[MultiPartParser],
+    )
+
+    def audio(self, request, pk):
+        obj = self.get_object()
+        serializer = self.serializer_class(obj, data=request.data,
+                                           partial=True)
+        if serializer.is_valid():
+            serializer.save()
+            return Response(serializer.data)
+        return Response(serializer.errors,
+                                 status.HTTP_400_BAD_REQUEST)
 
     def list(self, request):
         queryset = RatedAudio.objects.filter(Q(status=1) & ~Q(audio_ratings__rater=request.user))

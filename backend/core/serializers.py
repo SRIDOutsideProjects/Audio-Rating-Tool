@@ -18,3 +18,9 @@ class RatingSerializer(BulkSerializerMixin,serializers.ModelSerializer):
         model = Rating
         list_serializer_class = BulkListSerializer
         fields = ('value','remarks','audio','rater')
+
+
+class RatedAudioDataSerializer(serializers.ModelSerializer):
+    class Meta:
+        model=RatedAudio
+        fields=('audio',)
