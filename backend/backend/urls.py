@@ -33,7 +33,7 @@ from rest_framework_simplejwt.views import (
 
 schema_view = get_schema_view(
     openapi.Info(
-        title="Audio Annotation API",
+        title="Audio Rating API",
         default_version="v1",
         description="Test description",
         contact=openapi.Contact(email="pk20pankajjha@gmail.com"),
